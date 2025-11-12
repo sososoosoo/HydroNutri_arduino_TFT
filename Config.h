@@ -160,11 +160,39 @@ struct AlarmState {
 };
 
 
+struct SystemSettings {
+    // Feed schedule
+    struct FeedSchedule {
+        uint8_t hour;
+        uint8_t minute;
+        int grams;
+        bool enabled;
+    } feed_schedule[3];
+
+    // Nutrient settings
+    struct { int A, B, C, D; } nutrient_ratio;
+    int nutrient_amount_ml;
+
+    // Grow LED settings
+    int grow_led_brightness;
+    struct LEDSchedule {
+        uint8_t on_hour, on_minute;
+        uint8_t off_hour, off_minute;
+        bool enabled;
+    } grow_led_schedule;
+
+    // General settings
+    bool module_enable[4]; // TANK, GROW, NUTRI, FEED
+    bool time_sync_from_server;
+    char fw_version[16];
+};
+
 // ==================== 전역 상태 변수 및 뮤텍스 (외부 선언) ====================
 // 이 변수들의 실제 정의는 .ino 파일에 있습니다.
 extern SystemState g_systemState;
 extern LEDState g_ledState;
 extern AlarmState g_alarmState;
+extern SystemSettings g_settings;
 extern SemaphoreHandle_t g_stateMutex;
 
 

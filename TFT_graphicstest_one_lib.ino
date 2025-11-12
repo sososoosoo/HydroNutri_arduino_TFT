@@ -26,12 +26,14 @@
 #include "SettingsScreen.h"
 #include "CANHandler.h"
 #include "AlarmManager.h"
+#include "Persistence.h"
 
 // ==================== 전역 객체 및 상태 변수 정의 ====================
 // Config.h에 extern으로 선언된 변수들의 실제 정의
 SystemState g_systemState;
 LEDState g_ledState;
 AlarmState g_alarmState;
+SystemSettings g_settings;
 SemaphoreHandle_t g_stateMutex;
 
 // FreeRTOS Task 핸들
@@ -72,12 +74,31 @@ void initSystemData() {
     memset(&g_alarmState, 0, sizeof(AlarmState));
     
     g_systemState.serverConnected = false;
+
+    // Initialize settings with default values first
+    memset(&g_settings, 0, sizeof(SystemSettings));
+    strcpy(g_settings.fw_version, "0.1.0");
+    g_settings.time_sync_from_server = true;
+    for(int i=0; i<4; ++i) g_settings.module_enable[i] = true;
+
+    g_settings.feed_schedule[0] = {7, 30, 5, true};
+    g_settings.feed_schedule[1] = {12, 0, 5, true};
+    g_settings.feed_schedule[2] = {18, 30, 5, true};
+
+    g_settings.grow_led_schedule = {8, 0, 22, 0, true};
+    g_settings.grow_led_brightness = 80;
+
+    // Then, try to load settings from NVS
+    loadSettings(g_settings);
 }
 
 // ==================== Setup ====================
 void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== Smart Farm Display Controller (FreeRTOS) ===");
+
+    // Initialize NVS
+    init_nvs();
 
     // 뮤텍스 생성
     g_stateMutex = xSemaphoreCreateMutex();
@@ -109,127 +130,432 @@ void setup() {
 
     tankScreen = new TankScreen(&tft);
     tankScreen->setStateReference(&g_systemState);
-    // TODO: 다른 화면들도 새로운 데이터 구조를 사용하도록 수정하고 참조를 설정해야 합니다.
-    // 예: growBoxScreen->setStateReference(&g_systemState);
+    tankScreen->setCANHandler(&canHandler);
 
-    Serial.println("Hardware and screens initialized.");
+    growBoxScreen = new GrowBoxScreen(&tft);
+    growBoxScreen->setStateReference(&g_systemState);
 
-    // FreeRTOS Task 생성
-    xTaskCreatePinnedToCore(uiTask, "UITask", TASK_UI_STACK_SIZE, NULL, TASK_UI_PRIORITY, &g_uiTaskHandle, TASK_UI_CORE);
-    xTaskCreatePinnedToCore(canTask, "CANTask", TASK_CAN_STACK_SIZE, NULL, TASK_CAN_PRIORITY, &g_canTaskHandle, TASK_CAN_CORE);
-    xTaskCreatePinnedToCore(canWatchdogTask, "CANWatchdogTask", 2048, NULL, TASK_CAN_PRIORITY, &g_canWatchdogTaskHandle, TASK_CAN_CORE);
-    xTaskCreatePinnedToCore(uartTask, "UARTTask", TASK_UART_STACK_SIZE, NULL, TASK_UART_PRIORITY, &g_uartTaskHandle, TASK_UART_CORE);
-    xTaskCreatePinnedToCore(schedulerTask, "SchedulerTask", TASK_SCHEDULER_STACK_SIZE, NULL, TASK_SCHEDULER_PRIORITY, &g_schedulerTaskHandle, TASK_SCHEDULER_CORE);
+    nutrientScreen = new NutrientScreen(&tft);
+    nutrientScreen->setStateReference(&g_systemState);
 
-    Serial.println("All tasks created. System is running.");
+    feederScreen = new FeederScreen(&tft);
+    feederScreen->setStateReference(&g_systemState);
 
-    // setup() 완료 후 vTaskStartScheduler()가 자동으로 호출됨.
-    // loop() Task는 더 이상 주도적인 역할을 하지 않음.
-}
+        logScreen = new LogScreen(&tft);
 
-// ==================== 메인 루프 (FreeRTOS에서는 거의 사용 안 함) ====================
-void loop() {
-    // 모든 작업은 개별 Task에서 처리되므로 loop는 비워두거나 최소한의 작업만 수행
-    vTaskDelay(pdMS_TO_TICKS(1000));
-}
+        logScreen->setStateReference(&g_alarmState);
 
-// ==================== UI Task ====================
-// 화면 갱신, 로터리 엔코더 및 버튼 입력 처리
-void uiTask(void *pvParameters) {
-    Serial.println("UI Task started.");
-
-    // 로터리 엔코더 관련 변수
-    int lastEncoderValue = 0;
-    int encoderValue = 0;
-    unsigned long lastEncoderTime = 0;
-    bool buttonPressed = false;
-    unsigned long lastButtonTime = 0;
     
-    // 로터리 엔코더 초기화
-    pinMode(ENCODER_CLK, INPUT_PULLUP);
-    pinMode(ENCODER_DT, INPUT_PULLUP);
-    pinMode(ENCODER_SW, INPUT_PULLUP);
 
-    // 인터럽트 핸들러 (람다 함수 사용)
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), [&]() {
-        if (millis() - lastEncoderTime < 3) return;
-        lastEncoderTime = millis();
-        if (digitalRead(ENCODER_DT) != digitalRead(ENCODER_CLK)) {
-            encoderValue++;
-        } else {
-            encoderValue--;
-        }
-    }, CHANGE);
+        settingsScreen = new SettingsScreen(&tft);
 
-    // 초기 화면 그리기를 위해 플래그 설정
-    screenManager.needsFullRedraw();
+        settingsScreen->setSettingsReference(&g_settings);
 
-    for (;;) {
-        // --- 입력 처리 ---
-        if (encoderValue != lastEncoderValue) {
-            int direction = (encoderValue > lastEncoderValue) ? 1 : -1;
-            lastEncoderValue = encoderValue;
-            
-            // TODO: 현재 화면에 따라 회전 동작을 다르게 처리
-            // 지금은 모든 화면에서 화면 전환으로 동작
-            if (direction > 0) {
-                screenManager.nextScreen();
-            } else {
-                screenManager.prevScreen();
-            }
-        }
+    
 
-        if (digitalRead(ENCODER_SW) == LOW) {
-            if (!buttonPressed && (millis() - lastButtonTime > 250)) {
-                buttonPressed = true;
-                lastButtonTime = millis();
-                // TODO: 현재 화면에 따라 클릭 동작을 다르게 처리
-                Serial.printf("Encoder Clicked on screen %s!\n", screenManager.getCurrentScreenName());
-            }
-        } else {
-            buttonPressed = false;
-        }
+        Serial.println("Hardware and screens initialized.");
 
-        // --- 상태에 따른 LED 업데이트 ---
-        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            ledController.setBlue(g_ledState.blue);
-            ledController.setGreen(g_ledState.green);
-            ledController.setRed(g_ledState.red);
-            xSemaphoreGive(g_stateMutex);
-        }
-        ledController.update();
+    
 
+        // FreeRTOS Task 생성
 
-        // --- 현재 활성화된 화면 업데이트 ---
-        bool needsRedraw = screenManager.needsFullRedraw();
+        xTaskCreatePinnedToCore(uiTask, "UITask", TASK_UI_STACK_SIZE, NULL, TASK_UI_PRIORITY, &g_uiTaskHandle, TASK_UI_CORE);
 
-        switch (screenManager.getCurrentScreen()) {
-            case SCREEN_DASHBOARD:
-                if (needsRedraw) dashboard->begin();
-                dashboard->update();
-                break;
-            
-            case SCREEN_TANK:
-                if (needsRedraw) tankScreen->begin();
-                tankScreen->update();
-                break;
+        xTaskCreatePinnedToCore(canTask, "CANTask", TASK_CAN_STACK_SIZE, NULL, TASK_CAN_PRIORITY, &g_canTaskHandle, TASK_CAN_CORE);
 
-            // 다른 화면들도 위와 같이 임시 처리
-            default:
-                if (needsRedraw) {
-                    tft.fillScreen(COLOR_BACKGROUND);
-                    tft.setTextColor(COLOR_TEXT);
-                    tft.setTextDatum(MC_DATUM);
-                    const char* screenName = screenManager.getCurrentScreenName();
-                    tft.drawString(screenName, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
-                }
-                break;
-        }
+        xTaskCreatePinnedToCore(canWatchdogTask, "CANWatchdogTask", 2048, NULL, TASK_CAN_PRIORITY, &g_canWatchdogTaskHandle, TASK_CAN_CORE);
 
-        // Task 주기
-        vTaskDelay(pdMS_TO_TICKS(50)); // UI 반응성을 위해 딜레이를 줄임
+        xTaskCreatePinnedToCore(uartTask, "UARTTask", TASK_UART_STACK_SIZE, NULL, TASK_UART_PRIORITY, &g_uartTaskHandle, TASK_UART_CORE);
+
+        xTaskCreatePinnedToCore(schedulerTask, "SchedulerTask", TASK_SCHEDULER_STACK_SIZE, NULL, TASK_SCHEDULER_PRIORITY, &g_schedulerTaskHandle, TASK_SCHEDULER_CORE);
+
+    
+
+        Serial.println("All tasks created. System is running.");
+
+    
+
+        // setup() 완료 후 vTaskStartScheduler()가 자동으로 호출됨.
+
+        // loop() Task는 더 이상 주도적인 역할을 하지 않음.
+
     }
-}
+
+    
+
+    // ==================== 메인 루프 (FreeRTOS에서는 거의 사용 안 함) ====================
+
+    void loop() {
+
+        // 모든 작업은 개별 Task에서 처리되므로 loop는 비워두거나 최소한의 작업만 수행
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+    }
+
+    
+
+    // ==================== UI Task ====================
+
+    // 화면 갱신, 로터리 엔코더 및 버튼 입력 처리
+
+    void uiTask(void *pvParameters) {
+
+        Serial.println("UI Task started.");
+
+    
+
+        // 로터리 엔코더 관련 변수
+
+        int lastEncoderValue = 0;
+
+        int encoderValue = 0;
+
+        unsigned long lastEncoderTime = 0;
+
+        bool buttonPressed = false;
+
+        unsigned long lastButtonTime = 0;
+
+        
+
+        // 로터리 엔코더 초기화
+
+        pinMode(ENCODER_CLK, INPUT_PULLUP);
+
+        pinMode(ENCODER_DT, INPUT_PULLUP);
+
+        pinMode(ENCODER_SW, INPUT_PULLUP);
+
+    
+
+        // 인터럽트 핸들러 (람다 함수 사용)
+
+        attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), [&]() {
+
+            if (millis() - lastEncoderTime < 3) return;
+
+            lastEncoderTime = millis();
+
+            if (digitalRead(ENCODER_DT) != digitalRead(ENCODER_CLK)) {
+
+                encoderValue++;
+
+            } else {
+
+                encoderValue--;
+
+            }
+
+        }, CHANGE);
+
+    
+
+        // 초기 화면 그리기를 위해 플래그 설정
+
+        screenManager.needsFullRedraw();
+
+    
+
+        for (;;) {
+
+                    // --- 입력 처리 ---
+
+                    int direction = 0;
+
+                    if (encoderValue != lastEncoderValue) {
+
+                        direction = (encoderValue > lastEncoderValue) ? 1 : -1;
+
+                        lastEncoderValue = encoderValue;
+
+                    }
+
+            
+
+                    bool clicked = false;
+
+                    if (digitalRead(ENCODER_SW) == LOW) {
+
+                        if (!buttonPressed && (millis() - lastButtonTime > 250)) {
+
+                            buttonPressed = true;
+
+                            lastButtonTime = millis();
+
+                            clicked = true;
+
+                        }
+
+                    } else {
+
+                        buttonPressed = false;
+
+                    }
+
+            
+
+                    // --- 현재 화면에 입력 전달 ---
+
+                    switch (screenManager.getCurrentScreen()) {
+
+                        case SCREEN_DASHBOARD:
+
+                            if (direction != 0) { // Dashboard에서는 화면 전환
+
+                                if (direction > 0) screenManager.nextScreen();
+
+                                else screenManager.prevScreen();
+
+                            }
+
+                            if (clicked) { // Dashboard에서 클릭 시 Tank 화면으로 이동 (예시)
+
+                                screenManager.setScreen(SCREEN_TANK);
+
+                            }
+
+                            break;
+
+                        
+
+                        case SCREEN_TANK:
+
+                            if (direction != 0) tankScreen->onEncoderRotate(direction);
+
+                            if (clicked) tankScreen->onButtonClick();
+
+                            // BACK 버튼 처리
+
+                            if (clicked && tankScreen->getSelectedItem() == TANK_CONTROL_BACK && !tankScreen->isEditMode()) {
+
+                                screenManager.goToDashboard();
+
+                            }
+
+                            break;
+
+            
+
+                        case SCREEN_GROWBOX:
+
+                            if (direction != 0) growBoxScreen->onEncoderRotate(direction);
+
+                            if (clicked) growBoxScreen->onButtonClick();
+
+                            if (clicked && growBoxScreen->getSelectedItem() == GROWBOX_CONTROL_BACK && !growBoxScreen->isEditMode()) {
+
+                                screenManager.goToDashboard();
+
+                            }
+
+                            break;
+
+            
+
+                        case SCREEN_NUTRIENT:
+
+                            if (direction != 0) nutrientScreen->onEncoderRotate(direction);
+
+                            if (clicked) nutrientScreen->onButtonClick();
+
+                            if (clicked && nutrientScreen->getSelectedItem() == NUTRIENT_CONTROL_BACK) {
+
+                                screenManager.goToDashboard();
+
+                            }
+
+                            break;
+
+            
+
+                        case SCREEN_FEEDER:
+
+                            if (direction != 0) feederScreen->onEncoderRotate(direction);
+
+                            if (clicked) feederScreen->onButtonClick();
+
+                             if (clicked && feederScreen->getSelectedItem() == FEEDER_CONTROL_BACK && !feederScreen->isEditMode()) {
+
+                                screenManager.goToDashboard();
+
+                            }
+
+                            break;
+
+            
+
+                        case SCREEN_LOG:
+
+                            if (direction != 0) logScreen->onEncoderRotate(direction);
+
+                            if (clicked) logScreen->onButtonClick();
+
+                            break;
+
+            
+
+                        case SCREEN_SETTINGS:
+
+                            if (direction != 0) settingsScreen->onEncoderRotate(direction);
+
+                            if (clicked) settingsScreen->onButtonClick();
+
+                            // if (clicked && settingsScreen->getSelectedItem() == SETTINGS_BACK) {
+
+                            //     screenManager.goToDashboard();
+
+                            // }
+
+                            break;
+
+            
+
+                        default:
+
+                            if (direction != 0) {
+
+                                if (direction > 0) screenManager.nextScreen();
+
+                                else screenManager.prevScreen();
+
+                            }
+
+                            break;
+
+                    }
+
+                    
+
+                    // --- 상태에 따른 LED 업데이트 ---
+
+            if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+                ledController.setBlue(g_ledState.blue);
+
+                ledController.setGreen(g_ledState.green);
+
+                ledController.setRed(g_ledState.red);
+
+                xSemaphoreGive(g_stateMutex);
+
+            }
+
+            ledController.update();
+
+    
+
+    
+
+            // --- 현재 활성화된 화면 업데이트 ---
+
+            bool needsRedraw = screenManager.needsFullRedraw();
+
+    
+
+            switch (screenManager.getCurrentScreen()) {
+
+                case SCREEN_DASHBOARD:
+
+                    if (needsRedraw) dashboard->begin();
+
+                    dashboard->update();
+
+                    break;
+
+                
+
+                case SCREEN_TANK:
+
+                    if (needsRedraw) tankScreen->begin();
+
+                    tankScreen->update();
+
+                    break;
+
+    
+
+                case SCREEN_GROWBOX:
+
+                    if (needsRedraw) growBoxScreen->begin();
+
+                    growBoxScreen->update();
+
+                    break;
+
+    
+
+                case SCREEN_NUTRIENT:
+
+                    if (needsRedraw) nutrientScreen->begin();
+
+                    nutrientScreen->update();
+
+                    break;
+
+    
+
+                case SCREEN_FEEDER:
+
+                    if (needsRedraw) feederScreen->begin();
+
+                    feederScreen->update();
+
+                    break;
+
+    
+
+                case SCREEN_LOG:
+
+                    if (needsRedraw) logScreen->begin();
+
+                    logScreen->update();
+
+                    break;
+
+                
+
+                case SCREEN_SETTINGS:
+
+                    if (needsRedraw) settingsScreen->begin();
+
+                    settingsScreen->update();
+
+                    break;
+
+    
+
+                // 다른 화면들도 위와 같이 임시 처리
+
+                default:
+
+                    if (needsRedraw) {
+
+                        tft.fillScreen(COLOR_BACKGROUND);
+
+                        tft.setTextColor(COLOR_TEXT);
+
+                        tft.setTextDatum(MC_DATUM);
+
+                        const char* screenName = screenManager.getCurrentScreenName();
+
+                        tft.drawString(screenName, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+
+                    }
+
+                    break;
+
+            }
+
+    
+
+            // Task 주기
+
+            vTaskDelay(pdMS_TO_TICKS(50)); // UI 반응성을 위해 딜레이를 줄임
+
+        }
+
+    }
 
 // ==================== CAN Task ====================
 // CAN 메시지 수신 및 파싱
@@ -329,19 +655,76 @@ void canWatchdogTask(void *pvParameters) {
 
 // ==================== UART Task ====================
 // 서버(RPI)와 데이터 송수신
+
+// CRC-16/X.25
+uint16_t crc16_hqx(const uint8_t *data, uint16_t length) {
+    uint16_t crc = 0xFFFF;
+    while (length--) {
+        crc ^= *data++;
+        for (uint8_t i = 0; i < 8; i++) {
+            if (crc & 0x0001) {
+                crc = (crc >> 1) ^ 0x8408;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
 void uartTask(void *pvParameters) {
     Serial.println("UART Task started.");
-    for (;;) {
-        // TODO: 서버로 g_systemState를 JSON으로 변환하여 전송하는 로직 구현
-        // TODO: 서버로부터 오는 명령 수신 및 처리 로직 구현
+    static bool serverSimConnected = true; // 시뮬레이션용 서버 연결 상태
 
-        // 임시: 서버 연결 상태 LED 제어
-        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            g_ledState.blue = g_systemState.serverConnected;
+    for (;;) {
+        // --- 상태 전송 ---
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            g_systemState.serverConnected = serverSimConnected;
+            g_ledState.blue = serverSimConnected;
+
+            if (serverSimConnected) {
+                // 1. Create JSON string manually
+                String json = "{";
+                json += "\"ts\":" + String(millis()) + ",";
+                json += "\"state\":{";
+                json += "\"tank\":{\"temp\":" + String(g_systemState.tank.temp) + ",\"level\":" + String(g_systemState.tank.level) + "},";
+                json += "\"grow\":{\"temp\":" + String(g_systemState.grow.temp) + ",\"hum\":" + String(g_systemState.grow.hum) + "}";
+                json += "},";
+                json += "\"alarms\":{";
+                for (int i = 0; i < g_alarmState.count; ++i) {
+                    json += "\"" + String(g_alarmState.active_alarms[i].code) + "\":\"" + String(g_alarmState.active_alarms[i].msg) + "\"";
+                    if (i < g_alarmState.count - 1) json += ",";
+                }
+                json += "},";
+                json += "\"fw\":\"" + String(g_settings.fw_version) + "\"";
+                json += "}";
+
+                // 2. Pack into binary frame [STX, len(2), type(1), data(N), crc(2), ETX]
+                uint16_t body_len = json.length() + 1; // +1 for type byte
+                uint16_t pkt_len = 2 + body_len + 2 + 1;
+                uint8_t* pkt = new uint8_t[pkt_len];
+
+                pkt[0] = 0x02; // STX
+                pkt[1] = body_len & 0xFF;
+                pkt[2] = (body_len >> 8) & 0xFF;
+                pkt[3] = 0x01; // type = status snapshot
+                memcpy(&pkt[4], json.c_str(), json.length());
+                
+                uint16_t crc = crc16_hqx(&pkt[3], body_len);
+                pkt[4 + json.length()] = crc & 0xFF;
+                pkt[4 + json.length() + 1] = (crc >> 8) & 0xFF;
+                pkt[4 + json.length() + 2] = 0x03; // ETX
+
+                // 3. Write to Serial
+                Serial.write(pkt, pkt_len);
+                delete[] pkt;
+            }
             xSemaphoreGive(g_stateMutex);
         }
 
-        // Task 주기
+        // --- 명령 수신 (TODO) ---
+        // if (Serial.available()) { ... }
+
         vTaskDelay(pdMS_TO_TICKS(UART_PERIOD_MS));
     }
 }
@@ -350,12 +733,56 @@ void uartTask(void *pvParameters) {
 // 시간 기반 작업(급여, 조명 등) 스케줄링
 void schedulerTask(void *pvParameters) {
     Serial.println("Scheduler Task started.");
-    for (;;) {
-        // TODO: 현재 시간을 확인하고, NVS에 저장된 스케줄과 비교하여
-        // 작업(급여, 조명 제어 등)을 실행해야 할 시간인지 확인.
-        // 작업을 실행할 때는 CAN 명령 전송 등의 함수를 호출.
+    static uint8_t last_minute = 99;
 
-        // Task 주기
+    for (;;) {
+        // 1초마다 실행
         vTaskDelay(pdMS_TO_TICKS(SCHEDULER_PERIOD_MS));
+
+        // TODO: RTC로부터 실제 시간 가져오기
+        // 임시로 millis()를 사용하여 시간 시뮬레이션 (부팅 후 경과 시간)
+        unsigned long now_secs = millis() / 1000;
+        uint8_t current_hour = (now_secs / 3600) % 24;
+        uint8_t current_minute = (now_secs / 60) % 60;
+
+        // 1분에 한 번만 체크하도록 함
+        if (current_minute == last_minute) {
+            continue;
+        }
+        last_minute = current_minute;
+
+        Serial.printf("Scheduler check at %02d:%02d\n", current_hour, current_minute);
+
+        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            // --- 급여 스케줄 확인 ---
+            for (int i = 0; i < 3; ++i) {
+                if (g_settings.feed_schedule[i].enabled &&
+                    g_settings.feed_schedule[i].hour == current_hour &&
+                    g_settings.feed_schedule[i].minute == current_minute) {
+                    
+                    Serial.printf("Scheduled feeding: %d grams\n", g_settings.feed_schedule[i].grams);
+                    // TODO: canHandler.feedNow(g_settings.feed_schedule[i].grams);
+                }
+            }
+
+            // --- 재배기 LED 스케줄 확인 ---
+            if (g_settings.grow_led_schedule.enabled) {
+                if (g_settings.grow_led_schedule.on_hour == current_hour &&
+                    g_settings.grow_led_schedule.on_minute == current_minute) {
+                    
+                    Serial.printf("Scheduled LED ON. Brightness: %d\n", g_settings.grow_led_brightness);
+                    // TODO: canHandler.setGrowBoxLED(g_settings.grow_led_brightness);
+                }
+                
+                if (g_settings.grow_led_schedule.off_hour == current_hour &&
+                    g_settings.grow_led_schedule.off_minute == current_minute) {
+
+                    Serial.println("Scheduled LED OFF.");
+                    // TODO: canHandler.setGrowBoxLED(0);
+                }
+            }
+            
+            xSemaphoreGive(g_stateMutex);
+        }
     }
 }

@@ -62,4 +62,10 @@ static void clear_alarm(const char* code) {
     }
 }
 
+// Clear all active alarms.
+static void clear_all_alarms() {
+    g_alarmState.count = 0;
+    g_ledState.red = false;
+}
+
 #endif // ALARM_MANAGER_H
