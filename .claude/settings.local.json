@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ide__getDiagnostics",
+      "Bash(del \"C:\\Users\\jnjio\\OneDrive\\바탕 화면\\TFT_graphicstest_one_lib\\sketch_nov6a.ino\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
