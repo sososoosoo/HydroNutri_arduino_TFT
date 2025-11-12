@@ -117,18 +117,19 @@ private:
   void drawSensorValues() {
     int x = 10, y = HEADER_HEIGHT + 10, lineHeight = 18;
     tft->setTextSize(1);
-    tft->setTextColor(0x07FF);
+    tft->setTextColor(0x07FF, COLOR_BACKGROUND);
     tft->setCursor(x, y);
-    tft->print("=== SENSOR DATA ===");
+    tft->print("=== NUTRIENT LEVELS ===");
     y += lineHeight + 5;
 
     if (systemState && systemState->comm.nutri.ok) {
-      tft->setTextColor(COLOR_TEXT);
-      tft->setCursor(x, y); tft->printf("pH Level: %.1f", systemState->nutri.ph); y += lineHeight;
-      tft->setCursor(x, y); tft->printf("EC Level: %.1f mS/cm", systemState->nutri.ec); y += lineHeight;
-      tft->setCursor(x, y); tft->printf("Water Temp: %.1f C", systemState->nutri.temp); y += lineHeight;
+      tft->setTextColor(COLOR_TEXT, COLOR_BACKGROUND);
+      tft->setCursor(x, y); tft->printf("Nutrient A: %d ml", systemState->nutri.remain_ml.A); y += lineHeight;
+      tft->setCursor(x, y); tft->printf("Nutrient B: %d ml", systemState->nutri.remain_ml.B); y += lineHeight;
+      tft->setCursor(x, y); tft->printf("Nutrient C: %d ml", systemState->nutri.remain_ml.C); y += lineHeight;
+      tft->setCursor(x, y); tft->printf("Nutrient D: %d ml", systemState->nutri.remain_ml.D); y += lineHeight;
     } else {
-      tft->setTextColor(COLOR_ERROR);
+      tft->setTextColor(COLOR_ERROR, COLOR_BACKGROUND);
       tft->setTextDatum(MC_DATUM);
       tft->drawString("No Data Available", x + 80, y + 40);
       tft->setTextDatum(ML_DATUM);

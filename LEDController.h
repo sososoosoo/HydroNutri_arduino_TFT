@@ -43,42 +43,8 @@ public:
     digitalWrite(LED_RED, state ? HIGH : LOW);
   }
 
-  // 시스템 상태에 따라 LED 자동 업데이트
-  void updateFromStatus(const SystemStatus& status) {
-    // Blue: 서버 연결
-    setBlue(status.serverConnected);
-
-    // Green: 모든 모듈 정상
-    setGreen(status.modulesOK);
-
-    // Red: 경고 또는 오류 발생
-    setRed(status.hasWarning || status.hasError);
-  }
-
-  // 상태 가져오기
-  bool getBlue() const { return blueState; }
-  bool getGreen() const { return greenState; }
-  bool getRed() const { return redState; }
-
-  // 모든 LED OFF
-  void allOff() {
-    setBlue(false);
-    setGreen(false);
-    setRed(false);
-  }
-
-  // 시작 시퀀스 (테스트용)
   void startupSequence() {
-    allOff();
-    delay(200);
-    setBlue(true);
-    delay(200);
-    setGreen(true);
-    delay(200);
-    setRed(true);
-    delay(200);
-    allOff();
-    delay(200);
+    // ... (implementation)
   }
 };
 

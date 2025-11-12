@@ -55,8 +55,8 @@ public:
     setScreen(SCREEN_DASHBOARD);
   }
 
-  // 재그리기 필요 여부
-  bool needsFullRedraw() {
+  // 재그리기 필요 여부를 확인하고 플래그를 리셋
+  bool getAndClearNeedsRedrawFlag() {
     if (needsRedraw) {
       needsRedraw = false;
       return true;

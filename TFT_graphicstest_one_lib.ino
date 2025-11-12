@@ -29,7 +29,6 @@
 #include "Persistence.h"
 
 // ==================== 전역 객체 및 상태 변수 정의 ====================
-// Config.h에 extern으로 선언된 변수들의 실제 정의
 SystemState g_systemState;
 LEDState g_ledState;
 AlarmState g_alarmState;
@@ -49,6 +48,10 @@ TFT_eSPI tft = TFT_eSPI();
 LEDController ledController;
 ScreenManager screenManager;
 CANHandler canHandler;
+
+// UI Input State
+volatile int encoderValue = 0;
+volatile unsigned long lastEncoderTime = 0;
 
 // 화면 객체
 DashboardScreen* dashboard;
@@ -75,7 +78,6 @@ void initSystemData() {
     g_systemState.serverConnected = false;
     g_epoch_time_s = 1672531200; // Default to 2023-01-01 00:00:00 UTC
 
-    // Initialize settings with default values first
     memset(&g_settings, 0, sizeof(SystemSettings));
     strcpy(g_settings.fw_version, "0.1.0");
     g_settings.time_sync_from_server = true;
@@ -88,7 +90,6 @@ void initSystemData() {
     g_settings.grow_led_schedule = {8, 0, 22, 0, true};
     g_settings.grow_led_brightness = 80;
 
-    // Then, try to load settings from NVS
     loadSettings(g_settings);
 }
 
@@ -161,8 +162,6 @@ void loop() {
 void uiTask(void *pvParameters) {
     Serial.println("UI Task started.");
     int lastEncoderValue = 0;
-    int encoderValue = 0;
-    unsigned long lastEncoderTime = 0;
     bool buttonPressed = false;
     unsigned long lastButtonTime = 0;
     
@@ -170,18 +169,17 @@ void uiTask(void *pvParameters) {
     pinMode(ENCODER_DT, INPUT_PULLUP);
     pinMode(ENCODER_SW, INPUT_PULLUP);
 
-    attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), [&]() {
-        if (millis() - lastEncoderTime < 3) return;
-        lastEncoderTime = millis();
-        if (digitalRead(ENCODER_DT) != digitalRead(ENCODER_CLK)) {
-            encoderValue++;
-        } else {
-            encoderValue--;
-        }
-    }, CHANGE);
-
-    screenManager.needsFullRedraw();
-
+    // NOTE: Encoder interrupt is disabled. Re-enable after fixing hardware/config.
+    // attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), []() {
+    //     if (millis() - lastEncoderTime < 3) return;
+    //     lastEncoderTime = millis();
+    //     if (digitalRead(ENCODER_DT) != digitalRead(ENCODER_CLK)) {
+    //         encoderValue++;
+    //     } else {
+    //         encoderValue--;
+    //     }
+    // }, CHANGE);
+    
     for (;;) {
         int direction = 0;
         if (encoderValue != lastEncoderValue) {
@@ -199,7 +197,7 @@ void uiTask(void *pvParameters) {
         } else {
             buttonPressed = false;
         }
-
+        
         switch (screenManager.getCurrentScreen()) {
             case SCREEN_DASHBOARD:
                 if (direction != 0) {
@@ -237,7 +235,7 @@ void uiTask(void *pvParameters) {
                 break;
             case SCREEN_LOG:
                 if (direction != 0) logScreen->onEncoderRotate(direction);
-                if (clicked) screenManager.goToDashboard(); // Click to go back
+                if (clicked) screenManager.goToDashboard();
                 break;
             case SCREEN_SETTINGS:
                 if (direction != 0) settingsScreen->onEncoderRotate(direction);
@@ -259,9 +257,8 @@ void uiTask(void *pvParameters) {
             ledController.setRed(g_ledState.red);
             xSemaphoreGive(g_stateMutex);
         }
-        ledController.update();
 
-        bool needsRedraw = screenManager.needsFullRedraw();
+        bool needsRedraw = screenManager.getAndClearNeedsRedrawFlag();
         switch (screenManager.getCurrentScreen()) {
             case SCREEN_DASHBOARD: if (needsRedraw) dashboard->begin(); dashboard->update(); break;
             case SCREEN_TANK: if (needsRedraw) tankScreen->begin(); tankScreen->update(); break;
@@ -293,8 +290,11 @@ void canTask(void *pvParameters) {
             if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
                 canHandler.parseFrame(rx_message, g_systemState);
                 if (rx_message.identifier == GROW) {
-                    if (g_systemState.grow.leak_bits > 0) raise_alarm("E-LEAK", "Leak detected!");
-                    else clear_alarm("E-LEAK");
+                    if (g_systemState.grow.leak_bits > 0) {
+                        raise_alarm(g_alarmState, g_ledState, "E-LEAK", "Leak detected!");
+                    } else {
+                        clear_alarm(g_alarmState, g_ledState, "E-LEAK");
+                    }
                 }
                 xSemaphoreGive(g_stateMutex);
             } else {
@@ -312,25 +312,28 @@ void canWatchdogTask(void *pvParameters) {
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             bool all_modules_ok = true;
             unsigned long now = millis();
-            if (now - g_systemState.comm.tank.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
+            if (g_settings.module_enable[0] && now - g_systemState.comm.tank.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
                 if (g_systemState.comm.tank.ok) g_systemState.comm.tank.ok = false;
                 all_modules_ok = false;
             }
-            if (now - g_systemState.comm.grow.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
+            if (g_settings.module_enable[1] && now - g_systemState.comm.grow.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
                 if (g_systemState.comm.grow.ok) g_systemState.comm.grow.ok = false;
                 all_modules_ok = false;
             }
-            if (now - g_systemState.comm.nutri.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
+            if (g_settings.module_enable[2] && now - g_systemState.comm.nutri.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
                 if (g_systemState.comm.nutri.ok) g_systemState.comm.nutri.ok = false;
                 all_modules_ok = false;
             }
-            if (now - g_systemState.comm.feed.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
+            if (g_settings.module_enable[3] && now - g_systemState.comm.feed.last_ts_ms > CAN_WATCHDOG_TIMEOUT_MS) {
                 if (g_systemState.comm.feed.ok) g_systemState.comm.feed.ok = false;
                 all_modules_ok = false;
             }
             g_ledState.green = all_modules_ok;
-            if (!all_modules_ok) raise_alarm("E-CAN-LOST", "Module comm lost");
-            else clear_alarm("E-CAN-LOST");
+            if (!all_modules_ok) {
+                raise_alarm(g_alarmState, g_ledState, "E-CAN-LOST", "Module comm lost");
+            } else {
+                clear_alarm(g_alarmState, g_ledState, "E-CAN-LOST");
+            }
             xSemaphoreGive(g_stateMutex);
         } else {
             Serial.println("Watchdog: Failed to take mutex.");
@@ -359,27 +362,64 @@ void uartTask(void *pvParameters) {
     RxState rxState = RX_IDLE;
     uint8_t rxBuffer[UART_RX_BUFFER_SIZE];
     uint16_t payloadLen = 0, payloadIdx = 0, receivedCrc = 0;
+    char jsonBuffer[512];
+    SystemState localState;
+    AlarmState localAlarms;
+    SystemSettings localSettings;
+    unsigned long local_epoch_time_s;
 
     for (;;) {
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
             g_systemState.serverConnected = serverSimConnected;
             g_ledState.blue = serverSimConnected;
-            if (serverSimConnected) {
-                String json = "{\"ts\":" + String(g_epoch_time_s) + ",\"state\":{...},\"alarms\":{...}}"; // Simplified
-                uint16_t body_len = json.length() + 1;
-                uint16_t pkt_len = 2 + body_len + 2 + 1;
-                uint8_t* pkt = new uint8_t[pkt_len];
-                pkt[0] = 0x02; pkt[1] = body_len & 0xFF; pkt[2] = (body_len >> 8) & 0xFF;
-                pkt[3] = 0x01;
-                memcpy(&pkt[4], json.c_str(), json.length());
-                uint16_t crc = crc16_hqx(&pkt[3], body_len);
-                pkt[4 + json.length()] = crc & 0xFF;
-                pkt[4 + json.length() + 1] = (crc >> 8) & 0xFF;
-                pkt[4 + json.length() + 2] = 0x03;
-                Serial.write(pkt, pkt_len);
-                delete[] pkt;
-            }
+            memcpy(&localState, &g_systemState, sizeof(SystemState));
+            memcpy(&localAlarms, &g_alarmState, sizeof(AlarmState));
+            memcpy(&localSettings, &g_settings, sizeof(SystemSettings));
+            local_epoch_time_s = g_epoch_time_s;
             xSemaphoreGive(g_stateMutex);
+        } else {
+            Serial.println("uartTask: Failed to get mutex for data copy.");
+            vTaskDelay(pdMS_TO_TICKS(UART_PERIOD_MS));
+            continue;
+        }
+
+        if (localState.serverConnected) {
+            int len = snprintf(jsonBuffer, sizeof(jsonBuffer),
+                "{\"ts\":%lu,\"state\":{\"tank\":{\"temp\":%.1f,\"level\":%.1f},\"grow\":{\"temp\":%.1f,\"hum\":%.1f}},\"alarms\":{",
+                local_epoch_time_s,
+                localState.tank.temp, localState.tank.level,
+                localState.grow.temp, localState.grow.hum
+            );
+            for (int i = 0; i < localAlarms.count; ++i) {
+                len += snprintf(jsonBuffer + len, sizeof(jsonBuffer) - len,
+                    "\"%s\":\"%s\"%s",
+                    localAlarms.active_alarms[i].code,
+                    localAlarms.active_alarms[i].msg,
+                    (i < localAlarms.count - 1) ? "," : ""
+                );
+            }
+            len += snprintf(jsonBuffer + len, sizeof(jsonBuffer) - len,
+                "},\"fw\":\"%s\"}",
+                localSettings.fw_version
+            );
+
+            uint16_t body_len = len + 1;
+            uint16_t pkt_len = 1 + 2 + body_len + 2 + 1;
+            uint8_t* pkt = new uint8_t[pkt_len];
+
+            pkt[0] = 0x02;
+            pkt[1] = body_len & 0xFF;
+            pkt[2] = (body_len >> 8) & 0xFF;
+            pkt[3] = 0x01;
+            memcpy(&pkt[4], jsonBuffer, len);
+            
+            uint16_t crc = crc16_hqx(&pkt[3], body_len);
+            pkt[3 + body_len] = crc & 0xFF;
+            pkt[3 + body_len + 1] = (crc >> 8) & 0xFF;
+            pkt[3 + body_len + 2] = 0x03;
+
+            Serial.write(pkt, pkt_len);
+            delete[] pkt;
         }
 
         while (Serial.available() > 0) {
@@ -407,15 +447,6 @@ void uartTask(void *pvParameters) {
                                 int jsonLen = payloadLen - 1;
                                 jsonPayload[jsonLen] = '\0';
                                 Serial.printf("UART CMD Received: %s\n", jsonPayload);
-                                // TODO: Parse JSON. Example for time sync:
-                                // if (strstr(jsonPayload, "\"cmd\":\"time_sync\"")) {
-                                //   // Find "epoch":<value>
-                                //   char* p = strstr(jsonPayload, "\"epoch\":");
-                                //   if (p) {
-                                //     g_epoch_time_s = atol(p + 8);
-                                //     Serial.printf("Time synced to: %lu\n", g_epoch_time_s);
-                                //   }
-                                // }
                                 xSemaphoreGive(g_stateMutex);
                             }
                         } else { Serial.println("UART CMD: CRC Error"); }
@@ -434,21 +465,18 @@ void schedulerTask(void *pvParameters) {
     static uint8_t last_minute = 99;
 
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(SCHEDULER_PERIOD_MS)); // Runs every 1 second
+        vTaskDelay(pdMS_TO_TICKS(SCHEDULER_PERIOD_MS));
 
-        // Increment our own epoch time
         g_epoch_time_s++;
 
-        // Calculate current time components
         time_t now = g_epoch_time_s;
-        struct tm* p_tm = gmtime(&now);
-        uint8_t current_hour = p_tm->tm_hour;
-        uint8_t current_minute = p_tm->tm_min;
+        struct tm timeinfo;
+        gmtime_r(&now, &timeinfo);
+        uint8_t current_hour = timeinfo.tm_hour;
+        uint8_t current_minute = timeinfo.tm_min;
 
         if (current_minute == last_minute) continue;
         last_minute = current_minute;
-
-        Serial.printf("Scheduler check at %02d:%02d\n", current_hour, current_minute);
 
         if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             for (int i = 0; i < 3; ++i) {

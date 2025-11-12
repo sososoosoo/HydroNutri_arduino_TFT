@@ -2,29 +2,49 @@
 #define ALARM_MANAGER_H
 
 #include "Config.h"
+#include <time.h>
 
 // Note: This is a functional-style implementation, not a class,
 // to simplify integration with the global state objects.
+// All functions that modify state MUST be called within a mutex lock.
 
-// Alarms are managed directly on the g_alarmState struct.
-// All functions that modify g_alarmState MUST be called within a mutex lock.
+// Forward declaration for g_epoch_time_s
+extern volatile unsigned long g_epoch_time_s;
+
+static void add_log_entry(AlarmState& alarms, const char* code, bool cleared) {
+    if (alarms.log_count < MAX_ALARM_LOGS) {
+        alarms.log_count++;
+    }
+    
+    time_t now = g_epoch_time_s;
+    struct tm timeinfo;
+    gmtime_r(&now, &timeinfo); // Use thread-safe version
+
+    alarms.log[alarms.log_head].hour = timeinfo.tm_hour;
+    alarms.log[alarms.log_head].minute = timeinfo.tm_min;
+    alarms.log[alarms.log_head].second = timeinfo.tm_sec;
+    alarms.log[alarms.log_head].cleared = cleared;
+    strncpy(alarms.log[alarms.log_head].code, code, ALARM_CODE_MAX_LEN - 1);
+    alarms.log[alarms.log_head].code[ALARM_CODE_MAX_LEN - 1] = '\0';
+
+    alarms.log_head = (alarms.log_head + 1) % MAX_ALARM_LOGS;
+}
+
 
 // Raise an alarm. If it already exists, does nothing.
-static void raise_alarm(const char* code, const char* msg, bool sticky = true) {
-    if (g_alarmState.count >= MAX_ACTIVE_ALARMS) {
-        // Cannot add more alarms
-        return;
+static void raise_alarm(AlarmState& alarms, LEDState& leds, const char* code, const char* msg, bool sticky = true) {
+    if (alarms.count >= MAX_ACTIVE_ALARMS) {
+        return; // Cannot add more alarms
     }
 
-    // Check if alarm already exists
-    for (int i = 0; i < g_alarmState.count; i++) {
-        if (strcmp(g_alarmState.active_alarms[i].code, code) == 0) {
+    for (int i = 0; i < alarms.count; i++) {
+        if (strcmp(alarms.active_alarms[i].code, code) == 0) {
             return; // Already active
         }
     }
 
     // Add new alarm
-    Alarm& new_alarm = g_alarmState.active_alarms[g_alarmState.count];
+    Alarm& new_alarm = alarms.active_alarms[alarms.count];
     strncpy(new_alarm.code, code, ALARM_CODE_MAX_LEN - 1);
     new_alarm.code[ALARM_CODE_MAX_LEN - 1] = '\0';
     strncpy(new_alarm.msg, msg, ALARM_MSG_MAX_LEN - 1);
@@ -32,40 +52,33 @@ static void raise_alarm(const char* code, const char* msg, bool sticky = true) {
     new_alarm.sticky = sticky;
     new_alarm.raised_at_ms = millis();
     
-    g_alarmState.count++;
+    alarms.count++;
+    leds.red = true;
 
-    // Update Red LED state
-    g_ledState.red = true;
+    add_log_entry(alarms, code, false);
 }
 
 // Clear an alarm by its code.
-static void clear_alarm(const char* code) {
+static void clear_alarm(AlarmState& alarms, LEDState& leds, const char* code) {
     int found_index = -1;
-    for (int i = 0; i < g_alarmState.count; i++) {
-        if (strcmp(g_alarmState.active_alarms[i].code, code) == 0) {
+    for (int i = 0; i < alarms.count; i++) {
+        if (strcmp(alarms.active_alarms[i].code, code) == 0) {
             found_index = i;
             break;
         }
     }
 
     if (found_index != -1) {
-        // Shift remaining alarms down
-        for (int i = found_index; i < g_alarmState.count - 1; i++) {
-            g_alarmState.active_alarms[i] = g_alarmState.active_alarms[i + 1];
+        add_log_entry(alarms, code, true);
+        for (int i = found_index; i < alarms.count - 1; i++) {
+            alarms.active_alarms[i] = alarms.active_alarms[i + 1];
         }
-        g_alarmState.count--;
+        alarms.count--;
     }
 
-    // Update Red LED state
-    if (g_alarmState.count == 0) {
-        g_ledState.red = false;
+    if (alarms.count == 0) {
+        leds.red = false;
     }
-}
-
-// Clear all active alarms.
-static void clear_all_alarms() {
-    g_alarmState.count = 0;
-    g_ledState.red = false;
 }
 
 #endif // ALARM_MANAGER_H

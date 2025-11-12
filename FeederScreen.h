@@ -128,18 +128,16 @@ private:
   void drawSensorValues() {
     int x = 10, y = HEADER_HEIGHT + 10, lineHeight = 18;
     tft->setTextSize(1);
-    tft->setTextColor(0x07FF);
+    tft->setTextColor(0x07FF, COLOR_BACKGROUND);
     tft->setCursor(x, y);
     tft->print("=== SENSOR DATA ===");
     y += lineHeight + 5;
 
     if (systemState && systemState->comm.feed.ok) {
-      tft->setTextColor(COLOR_TEXT);
-      tft->setCursor(x, y); tft->printf("Remaining: %d g", systemState->feed.remaining); y += lineHeight;
-      tft->setCursor(x, y); tft->printf("Last Feed: %d g", systemState->feed.last_feed_g); y += lineHeight;
-      tft->setCursor(x, y); tft->printf("Status: %s", systemState->feed.motor_ok ? "OK" : "ERROR"); y += lineHeight;
+      tft->setTextColor(COLOR_TEXT, COLOR_BACKGROUND);
+      tft->setCursor(x, y); tft->printf("Remaining: %d g", systemState->feed.remain_g); y += lineHeight;
     } else {
-      tft->setTextColor(COLOR_ERROR);
+      tft->setTextColor(COLOR_ERROR, COLOR_BACKGROUND);
       tft->setTextDatum(MC_DATUM);
       tft->drawString("No Data Available", x + 80, y + 40);
       tft->setTextDatum(ML_DATUM);

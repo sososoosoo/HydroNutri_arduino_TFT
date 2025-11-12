@@ -18,6 +18,8 @@
 #define TASK_UI_STACK_SIZE 8192
 #define TASK_UART_STACK_SIZE 4096
 #define TASK_SCHEDULER_STACK_SIZE 4096
+#define UART_RX_BUFFER_SIZE 256
+
 
 // ==================== 핀 설정 ====================
 #define ENCODER_CLK 32
@@ -143,7 +145,8 @@ struct LEDState {
 };
 
 // --- 알람 상태 ---
-#define MAX_ACTIVE_ALARMS 5
+#define MAX_ACTIVE_ALARMS 10
+#define MAX_ALARM_LOGS 10
 #define ALARM_CODE_MAX_LEN 16
 #define ALARM_MSG_MAX_LEN 48
 
@@ -154,9 +157,22 @@ struct Alarm {
     unsigned long raised_at_ms;
 };
 
+struct AlarmLogEntry {
+  char code[ALARM_CODE_MAX_LEN];
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t second;
+  bool cleared;
+};
+
 struct AlarmState {
     Alarm active_alarms[MAX_ACTIVE_ALARMS];
     int count;
+
+    // Alarm Log
+    AlarmLogEntry log[MAX_ALARM_LOGS];
+    int log_head;
+    int log_count;
 };
 
 
