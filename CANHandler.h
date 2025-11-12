@@ -73,6 +73,28 @@ public:
         return initialized;
     }
 
+    // --- Control Command Senders ---
+
+    void setGrowBoxLED(uint8_t brightness) {
+        uint8_t data[3] = {CMD, 0x20, brightness}; // 0x20: LED Brightness CMD
+        sendMessage(GROW, data, sizeof(data));
+    }
+
+    void setGrowBoxSchedule(bool enable) {
+        uint8_t data[3] = {CMD, 0x21, (uint8_t)enable}; // 0x21: Schedule Enable CMD
+        sendMessage(GROW, data, sizeof(data));
+    }
+
+    void setNutrientPump(bool on) {
+        uint8_t data[3] = {CMD, 0x30, (uint8_t)on}; // 0x30: Pump On/Off
+        sendMessage(NUTRI, data, sizeof(data));
+    }
+
+    void feedNow(uint8_t grams) {
+        uint8_t data[3] = {CMD, 0x40, grams}; // 0x40: Feed Now
+        sendMessage(FEED, data, sizeof(data));
+    }
+
 private:
     bool initialized;
 

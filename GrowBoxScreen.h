@@ -3,6 +3,7 @@
 
 #include <TFT_eSPI.h>
 #include "Config.h"
+#include "CANHandler.h"
 
 // 제어 모드
 enum GrowBoxControlItem {
@@ -25,6 +26,7 @@ class GrowBoxScreen {
 private:
   TFT_eSPI* tft;
   SystemState* systemState;
+  CANHandler* canHandler;
   unsigned long lastUpdate;
   bool needsFullRedraw;
 
@@ -33,21 +35,20 @@ private:
   bool editMode;
   bool editingHour;
 
-  // 스케줄 시간 (UI용 임시 상태)
+  // UI용 임시 상태
   ScheduleTime scheduleOnTime;
   ScheduleTime scheduleOffTime;
-  // UI control state
   bool scheduleEnable;
   int ledBrightness;
-
 
 public:
   GrowBoxScreen(TFT_eSPI* display) :
     tft(display),
     systemState(nullptr),
+    canHandler(nullptr),
     lastUpdate(0),
     needsFullRedraw(true),
-    selectedItem(GROWBOX_CONTROL_NONE),
+    selectedItem(GROWBOX_CONTROL_LED_BRIGHTNESS),
     editMode(false),
     editingHour(true) {
     scheduleOnTime = {8, 0};
@@ -60,26 +61,27 @@ public:
     systemState = state;
   }
 
+  void setCANHandler(CANHandler* handler) {
+    canHandler = handler;
+  }
+
   void begin() {
     selectedItem = GROWBOX_CONTROL_LED_BRIGHTNESS;
     editMode = false;
     editingHour = true;
     needsFullRedraw = true;
 
-    // When entering the screen, copy the current state to the UI control state
-    if (systemState) {
-        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            ledBrightness = systemState->grow.led;
-            // scheduleEnable = systemState->grow.schedule_active; // Add this to state
-            xSemaphoreGive(g_stateMutex);
-        }
+    if (systemState && xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        ledBrightness = systemState->grow.led;
+        // scheduleEnable = g_settings.grow_led_schedule.enabled;
+        // scheduleOnTime = {g_settings.grow_led_schedule.on_hour, g_settings.grow_led_schedule.on_minute};
+        // scheduleOffTime = {g_settings.grow_led_schedule.off_hour, g_settings.grow_led_schedule.off_minute};
+        xSemaphoreGive(g_stateMutex);
     }
   }
 
   void update() {
-    if (millis() - lastUpdate < UI_PERIOD_MS) {
-        return;
-    }
+    if (millis() - lastUpdate < UI_PERIOD_MS) return;
     lastUpdate = millis();
 
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -93,10 +95,6 @@ public:
     } else {
         Serial.println("GrowBoxScreen: Failed to get state mutex.");
     }
-  }
-
-  void forceRedraw() {
-    needsFullRedraw = true;
   }
 
   void onEncoderRotate(int direction) {
@@ -116,11 +114,7 @@ public:
       if (newItem >= GROWBOX_CONTROL_COUNT) newItem = 0;
       selectedItem = (GrowBoxControlItem)newItem;
     }
-    
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        updateControls();
-        xSemaphoreGive(g_stateMutex);
-    }
+    needsFullRedraw = true;
   }
 
   void onButtonClick() {
@@ -128,13 +122,19 @@ public:
       if (editMode) editMode = false;
       return;
     }
+    if (!canHandler) return;
+
     if (selectedItem == GROWBOX_CONTROL_LED_BRIGHTNESS) {
       editMode = !editMode;
-      if (!editMode) { /* TODO: Send CAN command */ }
+      if (!editMode) {
+        canHandler->setGrowBoxLED(ledBrightness);
+        Serial.printf("CAN CMD: Set Grow LED to %d\n", ledBrightness);
+      }
     }
     if (selectedItem == GROWBOX_CONTROL_SCHEDULE_ENABLE) {
       scheduleEnable = !scheduleEnable;
-      /* TODO: Send CAN command */
+      canHandler->setGrowBoxSchedule(scheduleEnable);
+      Serial.printf("CAN CMD: Set Grow Schedule %s\n", scheduleEnable ? "ON" : "OFF");
     }
     if (selectedItem == GROWBOX_CONTROL_SCHEDULE_ON_TIME || selectedItem == GROWBOX_CONTROL_SCHEDULE_OFF_TIME) {
       if (editMode) {
@@ -143,24 +143,20 @@ public:
         editMode = true;
         editingHour = true;
       }
+      if (!editMode) {
+        // TODO: Send schedule time command
+      }
     }
-    if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        updateControls();
-        xSemaphoreGive(g_stateMutex);
-    }
+    needsFullRedraw = true;
   }
 
-  GrowBoxControlItem getSelectedItem() const {
-    return selectedItem;
-  }
+  GrowBoxControlItem getSelectedItem() const { return selectedItem; }
+  bool isEditMode() const { return editMode; }
 
 private:
   void adjustScheduleTime(ScheduleTime& time, int direction) {
-    if (editingHour) {
-      time.hour = (time.hour + direction + 24) % 24;
-    } else {
-      time.minute = (time.minute + direction * 5 + 60) % 60;
-    }
+    if (editingHour) time.hour = (time.hour + direction + 24) % 24;
+    else time.minute = (time.minute + direction * 5 + 60) % 60;
   }
 
   void draw() {
@@ -181,10 +177,7 @@ private:
   }
 
   void drawSensorValues() {
-    int x = 10;
-    int y = HEADER_HEIGHT + 10;
-    int lineHeight = 18;
-
+    int x = 10, y = HEADER_HEIGHT + 10, lineHeight = 18;
     tft->setTextSize(1);
     tft->setTextColor(0x07FF);
     tft->setCursor(x, y);
@@ -193,16 +186,9 @@ private:
 
     if (systemState && systemState->comm.grow.ok) {
       tft->setTextColor(COLOR_TEXT);
-      tft->setCursor(x, y);
-      tft->printf("Temperature: %.1f C", systemState->grow.temp);
-      y += lineHeight;
-
-      tft->setCursor(x, y);
-      tft->printf("Humidity: %.0f %%", systemState->grow.hum);
-      y += lineHeight;
-
-      tft->setCursor(x, y);
-      tft->print("Leak Status:");
+      tft->setCursor(x, y); tft->printf("Temperature: %.1f C", systemState->grow.temp); y += lineHeight;
+      tft->setCursor(x, y); tft->printf("Humidity: %.0f %%", systemState->grow.hum); y += lineHeight;
+      tft->setCursor(x, y); tft->print("Leak Status:");
       tft->setCursor(x + 100, y);
       if (systemState->grow.leak_bits > 0) {
         tft->setTextColor(COLOR_ERROR);
@@ -212,45 +198,34 @@ private:
         tft->print("OK");
       }
       y += lineHeight;
-
       tft->setTextColor(COLOR_TEXT);
-      tft->setCursor(x, y);
-      tft->print("LED Status:");
-      tft->setCursor(x + 100, y);
-      tft->setTextColor(COLOR_OK);
+      tft->setCursor(x, y); tft->print("LED Status:");
+      tft->setCursor(x + 100, y); tft->setTextColor(COLOR_OK);
       tft->printf("%d%%", systemState->grow.led);
-
     } else {
       tft->setTextColor(COLOR_ERROR);
       tft->setTextDatum(MC_DATUM);
       tft->drawString("No Data Available", x + 80, y + 40);
+      tft->setTextDatum(ML_DATUM);
     }
   }
 
   void drawControls() {
-    int x = 170;
-    int y = HEADER_HEIGHT + 10;
-    int lineHeight = 18;
-    int buttonHeight = 28;
-
+    int x = 170, y = HEADER_HEIGHT + 10, buttonHeight = 28;
     tft->setTextSize(1);
     tft->setTextColor(0x07FF);
     tft->setCursor(x, y);
     tft->print("=== CONTROLS ===");
-    y += lineHeight + 5;
+    y += 23;
 
     drawBrightnessControl(x, y, 140, buttonHeight + 20, selectedItem == GROWBOX_CONTROL_LED_BRIGHTNESS);
     y += buttonHeight + 25;
-
     drawButton(x, y, 140, buttonHeight, "SCHEDULE", scheduleEnable ? "ON" : "OFF", selectedItem == GROWBOX_CONTROL_SCHEDULE_ENABLE, scheduleEnable ? COLOR_OK : COLOR_INACTIVE);
     y += buttonHeight + 5;
-
     drawScheduleTime(x, y, 140, buttonHeight, "ON TIME", scheduleOnTime, selectedItem == GROWBOX_CONTROL_SCHEDULE_ON_TIME);
     y += buttonHeight + 5;
-
     drawScheduleTime(x, y, 140, buttonHeight, "OFF TIME", scheduleOffTime, selectedItem == GROWBOX_CONTROL_SCHEDULE_OFF_TIME);
     y += buttonHeight + 5;
-
     drawButton(x, y, 140, buttonHeight, "BACK", "", selectedItem == GROWBOX_CONTROL_BACK, COLOR_INACTIVE);
   }
 
@@ -259,16 +234,13 @@ private:
     tft->fillRect(x, y, w, h, COLOR_PANEL_BG);
     tft->drawRect(x, y, w, h, borderColor);
     if (selected) tft->drawRect(x + 1, y + 1, w - 2, h - 2, borderColor);
-
-    tft->setTextColor(COLOR_TEXT);
+    tft->setTextColor(COLOR_TEXT, COLOR_PANEL_BG);
     tft->setTextSize(1);
     tft->setTextDatum(ML_DATUM);
     tft->drawString(label, x + 5, y + 8);
-
     if (strlen(value) > 0) {
-      tft->setTextColor(valueColor);
+      tft->setTextColor(valueColor, COLOR_PANEL_BG);
       tft->setTextSize(2);
-      tft->setTextDatum(ML_DATUM);
       tft->drawString(value, x + 5, y + 20);
     }
   }
@@ -278,31 +250,24 @@ private:
     tft->fillRect(x, y, w, h, COLOR_PANEL_BG);
     tft->drawRect(x, y, w, h, borderColor);
     if (selected) tft->drawRect(x + 1, y + 1, w - 2, h - 2, borderColor);
-
-    tft->setTextColor(COLOR_TEXT);
+    tft->setTextColor(COLOR_TEXT, COLOR_PANEL_BG);
     tft->setTextSize(1);
     tft->setTextDatum(ML_DATUM);
     tft->drawString("LED BRIGHTNESS", x + 5, y + 8);
-
-    tft->setTextColor(COLOR_OK);
+    tft->setTextColor(COLOR_OK, COLOR_PANEL_BG);
     tft->setTextSize(2);
-    tft->setTextDatum(ML_DATUM);
     tft->drawString(String(ledBrightness) + "%", x + 5, y + 25);
-
     if (editMode && selected) {
-      tft->setTextColor(COLOR_WARNING);
+      tft->setTextColor(COLOR_WARNING, COLOR_PANEL_BG);
       tft->setTextSize(1);
       tft->setTextDatum(MR_DATUM);
       tft->drawString("EDIT", x + w - 5, y + 25);
     }
-
-    int barX = x + 5;
-    int barY = y + h - 8;
-    int barW = w - 10;
-    int barH = 5;
+    int barX = x + 5, barY = y + h - 8, barW = w - 10, barH = 5;
     tft->drawRect(barX, barY, barW, barH, COLOR_TEXT);
     int fillW = (barW - 2) * ledBrightness / 100;
     tft->fillRect(barX + 1, barY + 1, fillW, barH - 2, COLOR_OK);
+    tft->setTextDatum(ML_DATUM);
   }
 
   void drawScheduleTime(int x, int y, int w, int h, const char* label, const ScheduleTime& time, bool selected) {
@@ -310,29 +275,24 @@ private:
     tft->fillRect(x, y, w, h, COLOR_PANEL_BG);
     tft->drawRect(x, y, w, h, borderColor);
     if (selected) tft->drawRect(x + 1, y + 1, w - 2, h - 2, borderColor);
-
-    tft->setTextColor(COLOR_TEXT);
+    tft->setTextColor(COLOR_TEXT, COLOR_PANEL_BG);
     tft->setTextSize(1);
     tft->setTextDatum(ML_DATUM);
     tft->drawString(label, x + 5, y + 8);
-
     tft->setTextSize(2);
-    tft->setTextDatum(ML_DATUM);
-    String timeStr;
+    tft->setCursor(x + 5, y + 15);
     if (editMode && selected) {
-        // This part is complex to do with printf, String is easier
-        tft.setCursor(x + 5, y + 15);
-        if (editingHour) tft->setTextColor(COLOR_WARNING); else tft->setTextColor(COLOR_OK);
-        tft.print(String(time.hour < 10 ? "0" : "") + time.hour);
-        tft->setTextColor(COLOR_TEXT);
+        if (editingHour) tft->setTextColor(COLOR_WARNING, COLOR_PANEL_BG); else tft->setTextColor(COLOR_OK, COLOR_PANEL_BG);
+        tft->printf("%02d", time.hour);
+        tft->setTextColor(COLOR_TEXT, COLOR_PANEL_BG);
         tft->print(":");
-        if (!editingHour) tft->setTextColor(COLOR_WARNING); else tft->setTextColor(COLOR_OK);
-        tft->print(String(time.minute < 10 ? "0" : "") + time.minute);
+        if (!editingHour) tft->setTextColor(COLOR_WARNING, COLOR_PANEL_BG); else tft->setTextColor(COLOR_OK, COLOR_PANEL_BG);
+        tft->printf("%02d", time.minute);
     } else {
-        tft->setTextColor(COLOR_OK);
-        tft.setCursor(x + 5, y + 15);
+        tft->setTextColor(COLOR_OK, COLOR_PANEL_BG);
         tft->printf("%02d:%02d", time.hour, time.minute);
     }
+    tft->setTextDatum(ML_DATUM);
   }
 
   void drawFooter() {
@@ -352,14 +312,8 @@ private:
     }
   }
 
-  void updateSensorValues() {
-    drawSensorValues();
-  }
-
-  void updateControls() {
-    drawControls();
-    drawFooter();
-  }
+  void updateSensorValues() { drawSensorValues(); }
+  void updateControls() { drawControls(); drawFooter(); }
 };
 
 #endif // GROWBOX_SCREEN_H

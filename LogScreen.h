@@ -3,7 +3,6 @@
 
 #include <TFT_eSPI.h>
 #include "Config.h"
-#include "AlarmManager.h"
 
 class LogScreen {
 private:
@@ -11,13 +10,7 @@ private:
   AlarmState* alarmState;
   unsigned long lastUpdate;
   bool needsFullRedraw;
-
-  int scrollPosition;
-  bool showingMenu;
-  enum MenuOption { MENU_CLEAR_ALL, MENU_BACK, MENU_COUNT };
-  MenuOption selectedMenu;
-
-  const int LOGS_PER_PAGE = 8;
+  int scrollOffset;
 
 public:
   LogScreen(TFT_eSPI* display) :
@@ -25,79 +18,50 @@ public:
     alarmState(nullptr),
     lastUpdate(0),
     needsFullRedraw(true),
-    scrollPosition(0),
-    showingMenu(false),
-    selectedMenu(MENU_CLEAR_ALL) {}
+    scrollOffset(0) {}
 
   void setStateReference(AlarmState* alarms) {
     alarmState = alarms;
   }
 
   void begin() {
-    scrollPosition = 0;
-    showingMenu = false;
     needsFullRedraw = true;
+    scrollOffset = 0;
   }
 
   void update() {
-    if (millis() - lastUpdate < UI_PERIOD_MS) {
-        return;
-    }
+    if (millis() - lastUpdate < UI_PERIOD_MS) return;
     lastUpdate = millis();
 
     if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-        if (needsFullRedraw) {
-            draw();
-        }
-        xSemaphoreGive(g_stateMutex);
-    } else {
-        Serial.println("LogScreen: Failed to get state mutex.");
+      if (needsFullRedraw) {
+        draw();
+      }
+      xSemaphoreGive(g_stateMutex);
     }
   }
 
   void onEncoderRotate(int direction) {
-    if (showingMenu) {
-      int newMenu = (int)selectedMenu + direction;
-      if (newMenu < 0) newMenu = MENU_COUNT - 1;
-      if (newMenu >= MENU_COUNT) newMenu = 0;
-      selectedMenu = (MenuOption)newMenu;
-    } else {
-      if (alarmState && alarmState->count > 0) {
-        scrollPosition += direction;
-        if (scrollPosition < 0) scrollPosition = 0;
-        if (scrollPosition >= alarmState->count) scrollPosition = alarmState->count - 1;
-      }
-    }
+    if (!alarmState || alarmState->log_count == 0) return;
+
+    scrollOffset += direction;
+    int maxOffset = alarmState->log_count - 1;
+    if (scrollOffset < 0) scrollOffset = 0;
+    if (scrollOffset > maxOffset) scrollOffset = maxOffset;
+    
     needsFullRedraw = true;
   }
 
   void onButtonClick() {
-    if (showingMenu) {
-      if (selectedMenu == MENU_CLEAR_ALL) {
-        if (xSemaphoreTake(g_stateMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            clear_all_alarms();
-            xSemaphoreGive(g_stateMutex);
-        }
-        showingMenu = false;
-      } else if (selectedMenu == MENU_BACK) {
-        showingMenu = false;
-      }
-    } else {
-      showingMenu = true;
-      selectedMenu = MENU_CLEAR_ALL;
-    }
-    needsFullRedraw = true;
+    // On this screen, a click returns to the dashboard
+    // This is handled in the main uiTask loop
   }
 
 private:
   void draw() {
     tft->fillScreen(COLOR_BACKGROUND);
     drawHeader();
-    if (showingMenu) {
-      drawMenu();
-    } else {
-      drawLogList();
-    }
+    drawLogList();
     drawFooter();
     needsFullRedraw = false;
   }
@@ -107,78 +71,37 @@ private:
     tft->setTextColor(COLOR_TEXT);
     tft->setTextSize(2);
     tft->setTextDatum(ML_DATUM);
-    tft->drawString("LOGS & ALERTS", 10, HEADER_HEIGHT / 2);
+    tft->drawString("ALARM LOG", 10, HEADER_HEIGHT / 2);
   }
 
   void drawLogList() {
-    int y = HEADER_HEIGHT + 5;
-    int lineHeight = 22;
+    int x = 10, y = HEADER_HEIGHT + 10, lineHeight = 16;
+    int max_lines_on_screen = (SCREEN_HEIGHT - HEADER_HEIGHT - STATUS_BAR_HEIGHT - 20) / lineHeight;
 
-    if (!alarmState || alarmState->count == 0) {
-      tft->setTextColor(COLOR_INACTIVE);
+    tft->setTextSize(1);
+    
+    if (!alarmState || alarmState->log_count == 0) {
+      tft->setTextColor(COLOR_TEXT);
       tft->setTextDatum(MC_DATUM);
-      tft->drawString("No active alarms", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
+      tft->drawString("No alarm logs.", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
       return;
     }
 
-    int startIdx = scrollPosition;
-    for (int i = 0; i < LOGS_PER_PAGE; ++i) {
-        int logIdx = startIdx + i;
-        if (logIdx >= alarmState->count) break;
-        drawLogEntry(5, y + (i * lineHeight), alarmState->active_alarms[logIdx], logIdx == scrollPosition);
+    for (int i = 0; i < max_lines_on_screen; ++i) {
+      int log_index = (alarmState->log_head + scrollOffset + i) % MAX_ALARM_LOGS;
+      if (scrollOffset + i >= alarmState->log_count) break;
+
+      AlarmLogEntry* entry = &alarmState->log[log_index];
+      
+      if (entry->cleared) {
+        tft->setTextColor(COLOR_OK);
+      } else {
+        tft->setTextColor(COLOR_ERROR);
+      }
+      
+      tft->setCursor(x, y + i * lineHeight);
+      tft->printf("%02d:%02d:%02d %s %s", entry->hour, entry->minute, entry->second, entry->cleared ? "CLEAR" : "RAISE", entry->code);
     }
-  }
-
-  void drawLogEntry(int x, int y, const Alarm& alarm, bool selected) {
-    if (selected) {
-      tft->fillRect(x - 2, y - 2, SCREEN_WIDTH - 10, 20, COLOR_PANEL_BG);
-      tft->drawRect(x - 2, y - 2, SCREEN_WIDTH - 10, 20, COLOR_WARNING);
-    }
-
-    uint16_t typeColor = (alarm.code[0] == 'E') ? COLOR_ERROR : COLOR_WARNING;
-    const char* typeIcon = (alarm.code[0] == 'E') ? "[E]" : "[W]";
-
-    tft->setTextSize(1);
-    tft->setTextColor(typeColor);
-    tft->setCursor(x, y);
-    tft->print(typeIcon);
-
-    tft->setTextColor(COLOR_TEXT);
-    tft->setCursor(x + 25, y);
-    tft->print(alarm.msg);
-
-    tft->setTextColor(COLOR_INACTIVE);
-    unsigned long timeSince = (millis() - alarm.raised_at_ms) / 1000; // seconds
-    tft->setTextDatum(MR_DATUM);
-    tft->drawString(String(timeSince) + "s ago", SCREEN_WIDTH - 10, y + 4);
-    tft->setTextDatum(ML_DATUM);
-  }
-
-  void drawMenu() {
-    // Simplified menu
-    int menuWidth = 160, menuHeight = 80;
-    int menuX = (SCREEN_WIDTH - menuWidth) / 2;
-    int menuY = (SCREEN_HEIGHT - menuHeight) / 2;
-
-    tft->fillRect(menuX, menuY, menuWidth, menuHeight, COLOR_PANEL_BG);
-    tft->drawRect(menuX, menuY, menuWidth, menuHeight, COLOR_TEXT);
-
-    drawMenuItem(menuX + 10, menuY + 10, menuWidth - 20, 25, "Clear All", selectedMenu == MENU_CLEAR_ALL);
-    drawMenuItem(menuX + 10, menuY + 45, menuWidth - 20, 25, "Back", selectedMenu == MENU_BACK);
-  }
-
-  void drawMenuItem(int x, int y, int w, int h, const char* label, bool selected) {
-    if (selected) {
-      tft->fillRect(x, y, w, h, 0x18E3);
-      tft->drawRect(x, y, w, h, COLOR_WARNING);
-    } else {
-      tft->drawRect(x, y, w, h, COLOR_TEXT);
-    }
-    tft->setTextColor(COLOR_TEXT);
-    tft->setTextSize(1);
-    tft->setTextDatum(MC_DATUM);
-    tft->drawString(label, x + w / 2, y + h / 2);
-    tft->setTextDatum(ML_DATUM);
   }
 
   void drawFooter() {
@@ -187,11 +110,7 @@ private:
     tft->setTextSize(1);
     tft->setTextColor(COLOR_TEXT);
     tft->setTextDatum(MC_DATUM);
-    if (showingMenu) {
-      tft->drawString("Rotate: Select | Click: Apply", SCREEN_WIDTH / 2, y + STATUS_BAR_HEIGHT / 2);
-    } else {
-      tft->drawString("Rotate: Scroll | Click: Menu", SCREEN_WIDTH / 2, y + STATUS_BAR_HEIGHT / 2);
-    }
+    tft->drawString("Rotate: Scroll | Click: Back", SCREEN_WIDTH / 2, y + STATUS_BAR_HEIGHT / 2);
   }
 };
 

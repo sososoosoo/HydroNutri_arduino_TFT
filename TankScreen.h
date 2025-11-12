@@ -186,15 +186,18 @@ private:
     tft->fillRect(x, y, w, h, COLOR_PANEL_BG);
     tft->drawRect(x, y, w, h, borderColor);
     if (selected) tft->drawRect(x + 1, y + 1, w - 2, h - 2, borderColor);
-    tft->setTextColor(COLOR_TEXT);
-    tft->setTextSize(1);
+    
+    tft->setTextColor(COLOR_TEXT, COLOR_PANEL_BG);
+    tft->setTextSize(2);
     tft->setTextDatum(ML_DATUM);
-    tft->drawString(label, x + 5, y + 8);
+    tft->drawString(label, x + 5, y + h / 2);
+
     if (strlen(value) > 0) {
-      tft->setTextColor(valueColor);
-      tft->setTextSize(2);
-      tft->drawString(value, x + 5, y + 20);
+      tft->setTextColor(valueColor, COLOR_PANEL_BG);
+      tft->setTextDatum(MR_DATUM);
+      tft->drawString(value, x + w - 5, y + h / 2);
     }
+    tft->setTextDatum(ML_DATUM);
   }
 
   void drawPumpControl(int x, int y, int w, int h, bool selected) {
